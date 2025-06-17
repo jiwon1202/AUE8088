@@ -1,0 +1,27 @@
+python val.py --weights /home/cv/jw/AUE8088/runs/train/anchor2-all-2cls2/weights/best.pt --data /home/cv/jw/AUE8088/data/kaist-rgbt.yaml --img 640 --rgbt --task test --save-json 
+
+# yolov5n
+CUDA_VISIBLE_DEVICES=6 python train_simple.py \
+  --img 640 \
+  --batch-size 64\ 
+  --epochs 30 \
+  --data data/kaist-rgbt.yaml \
+  --cfg models/yolov5n_kaist-rgbt.yaml \
+  --weights yolov5n.pt \
+  --workers 16 \
+  --name anchor2-all-2cls  \        
+  --entity jiwon1202-hanyang-university \
+  --rgbt
+
+# yolov5x6
+CUDA_VISIBLE_DEVICES=7 python train_simple.py \
+  --img 640 \
+  --batch-size 64\
+  --epochs 30 \
+  --data data/kaist-rgbt.yaml \
+  --cfg models/yolov5x6_kaist-rgbt.yaml \
+  --weights yolov5x6.pt \ 
+  --workers 16 \
+  --name yolov5x-anchor2-all-2cls  \
+  --entity jiwon1202-hanyang-university \
+  --rgbt
