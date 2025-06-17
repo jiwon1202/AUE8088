@@ -69,28 +69,45 @@ def save_one_txt(predn, save_conf, shape, file):
             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
 
-def save_one_json(predn, jdict, path, index, class_map):
+def save_one_json(predn, jdict, path, index, class_map, image_name_to_id):
     """
     Saves one JSON detection result with image ID, category ID, bounding box, and score.
 
     Example: {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
     """
-    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+    image_name = path.stem 
+    image_id = image_name_to_id.get(image_name + ".jpg")
+
+    if image_id is None:
+        image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+        box = xyxy2xywh(predn[:, :4])  # xywh
+        box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+        for p, b in zip(predn.tolist(), box.tolist()):
+            if p[4] < 0.1:
+                continue
+            jdict.append(
+                {
+                    "image_name": image_id,
+                    "image_id": int(index),
+                    "category_id": class_map[int(p[5])],
+                    "bbox": [round(x, 3) for x in b],
+                    "score": round(p[4], 5),
+                }
+            )
+        return
+
     box = xyxy2xywh(predn[:, :4])  # xywh
-    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+    box[:, :2] -= box[:, 2:] / 2  # convert to top-left corner
     for p, b in zip(predn.tolist(), box.tolist()):
         if p[4] < 0.1:
             continue
-        jdict.append(
-            {
-                "image_name": image_id,
-                "image_id": int(index),
-                "category_id": class_map[int(p[5])],
-                "bbox": [round(x, 3) for x in b],
-                "score": round(p[4], 5),
-            }
-        )
-
+        jdict.append({
+            "image_name": image_name,
+            "image_id": int(image_id),
+            "category_id": class_map[int(p[5])],
+            "bbox": [round(x, 3) for x in b],
+            "score": round(p[4], 5),
+        })
 
 def process_batch(detections, labels, iouv):
     """
@@ -115,6 +132,30 @@ def process_batch(detections, labels, iouv):
                 # matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
             correct[matches[:, 1].astype(int), i] = True
+
+    # correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    # iou = box_iou(labels[:, 1:], detections[:, :4])
+    # correct_class = labels[:, 0:1] == detections[:, 5]
+    # for i in range(len(iouv)):
+    #     x = torch.where((iou >= iouv[i]) & correct_class)
+    #     if x[0].shape[0]:
+    #         # [label_idx, detect_idx, iou]
+    #         matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+
+    #         # IoU 기준 내림차순 정렬
+    #         matches = matches[matches[:, 2].argsort()[::-1]]
+
+    #         # detection index 기준으로 중복 제거
+    #         _, det_unique_idx = np.unique(matches[:, 1], return_index=True)
+    #         matches = matches[det_unique_idx]
+
+    #         # GT(label) 기준으로도 중복 제거 (여기서 빠졌던 것 추가!)
+    #         matches = matches[matches[:, 2].argsort()[::-1]]
+    #         _, gt_unique_idx = np.unique(matches[:, 0], return_index=True)
+    #         matches = matches[gt_unique_idx]
+
+    #         correct[matches[:, 1].astype(int), i] = True
+
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
 
 
@@ -149,6 +190,7 @@ def run(
     callbacks=Callbacks(),
     compute_loss=None,
     epoch=None,
+    rgbt=True
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -195,9 +237,15 @@ def run(
                 f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
                 f"classes). Pass correct combination of --weights and --data that are trained together."
             )
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        # dummy1 = torch.zeros((1, 3, imgsz, imgsz), device=device)
+        # dummy2 = torch.zeros((1, 3, imgsz, imgsz), device=device)
+        # model([dummy1, dummy2])  # warmup 수행
+        
+        # model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
+        rect = False
+
         dataloader = create_dataloader(
             data[task],
             imgsz,
@@ -208,6 +256,7 @@ def run(
             rect=rect,
             workers=workers,
             prefix=colorstr(f"{task}: "),
+            rgbt_input = rgbt
         )[0]
 
     seen = 0
@@ -290,20 +339,26 @@ def run(
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
+            
+            # predn = predn[(predn[:, 5] != 2)]  # 클래스 2 무시 !! 
+            # predn = predn[(predn[:, 5] != 2) & (predn[:, 5] != 3)]  # 클래스 2, 3 무시
+            with open('utils/eval/KAIST_annotation2.json', 'r') as f:
+                kaist_data = json.load(f)
+            image_name_to_id = {img['im_name']: img['id'] for img in kaist_data['images']}
 
             # Save/log
             if save_txt:
                 (save_dir / "labels").mkdir(parents=True, exist_ok=True)
                 save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
             if save_json:
-                save_one_json(predn, jdict, path, index, class_map)  # append to COCO-JSON dictionary
+                save_one_json(predn, jdict, path, index, class_map, image_name_to_id)  # append to COCO-JSON dictionary
             callbacks.run("on_val_image_end", pred, predn, path, names, ims[si])
 
         # Plot images
         if plots and batch_i < 3:
             desc = f"val_batch{batch_i}" if epoch is None else f"val_epoch{epoch}_batch{batch_i}"
-            plot_images(ims, targets, paths, save_dir / f"{desc}_labels.jpg", names)  # labels
-            plot_images(ims, output_to_target(preds), paths, save_dir / f"{desc}_pred.jpg", names)  # pred
+            plot_images(ims, targets, paths, Path(save_dir) / f"{desc}_labels.jpg", names)  # labels
+            plot_images(ims, output_to_target(preds), paths, Path(save_dir) / f"{desc}_pred.jpg", names)  # pred
 
         callbacks.run("on_val_batch_end", batch_i, ims, targets, paths, shapes, preds)
 
@@ -341,6 +396,7 @@ def run(
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
         callbacks.run("on_val_end", nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
 
+    print(len(jdict), "#!!")
     # Save JSON
     if save_json and len(jdict):
         if weights:
@@ -348,7 +404,7 @@ def run(
         else:
             w = f'epoch{epoch}'
 
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions
+        pred_json = str(Path(save_dir) / f"{w}_predictions.json")  # predictions
         LOGGER.info(f"\nSaving {pred_json}...")
 
         with open(pred_json, "w") as f:
@@ -359,9 +415,9 @@ def run(
         # Run evaluation: KAIST Multispectral Pedestrian Dataset
         try:
             # HACK: need to generate KAIST_annotation.json for your own validation set
-            if not os.path.exists('utils/eval/KAIST_annotation.json'):
-                raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
-            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_annotation.json --rstFile {pred_json}")
+            if not os.path.exists('utils/eval/KAIST_annotation2.json'):
+                raise FileNotFoundError('Please generate KAIST_annotation2.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
+            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_annotation2.json --rstFile {pred_json}")
         except Exception as e:
             LOGGER.info(f"kaisteval unable to run: {e}")
 
@@ -384,14 +440,14 @@ def parse_opt():
     parser.add_argument("--batch-size", type=int, default=32, help="batch size")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="inference size (pixels)")
     parser.add_argument("--conf-thres", type=float, default=0.001, help="confidence threshold")
-    parser.add_argument("--iou-thres", type=float, default=0.6, help="NMS IoU threshold")
+    parser.add_argument("--iou-thres", type=float, default=0.46, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300, help="maximum detections per image")
     parser.add_argument("--task", default="val", help="train, val, test, speed or study")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
     parser.add_argument("--single-cls", action="store_true", help="treat as single-class dataset")
     parser.add_argument("--augment", action="store_true", help="augmented inference")
-    parser.add_argument("--verbose", action="store_true", help="report mAP by class")
+    parser.add_argument("--verbose", action="store_true", help="report mAP by clsass")
     parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
     parser.add_argument("--save-hybrid", action="store_true", help="save label+prediction hybrid results to *.txt")
     parser.add_argument("--save-conf", action="store_true", help="save confidences in --save-txt labels")
@@ -401,6 +457,9 @@ def parse_opt():
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
+
+    parser.add_argument("--rgbt", action="store_true", help="use RGB-T multispectral input")  # !!
+
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith("coco.yaml")

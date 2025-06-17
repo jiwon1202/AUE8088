@@ -174,12 +174,14 @@ def create_dataloader(
     shuffle=False,
     seed=0,
     rgbt_input=False,
+    modality=None,  # 새로운 파라미터
 ):
     if rect and shuffle:
         LOGGER.warning("WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False")
         shuffle = False
 
     dataset_class = LoadImagesAndLabels if not rgbt_input else LoadRGBTImagesAndLabels
+
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = dataset_class(
             path,
@@ -195,6 +197,7 @@ def create_dataloader(
             image_weights=image_weights,
             prefix=prefix,
             rank=rank,
+            modality=modality,  # modality for RGBT input #!!
         )
 
     batch_size = min(batch_size, len(dataset))
@@ -324,9 +327,11 @@ class LoadImages:
         """Initializes YOLOv5 loader for images/videos, supporting glob patterns, directories, and lists of paths."""
         if isinstance(path, str) and Path(path).suffix == ".txt":  # *.txt file with img/vid/dir on each line
             path = Path(path).read_text().rsplit()
+
         files = []
         for p in sorted(path) if isinstance(path, (list, tuple)) else [path]:
             p = str(Path(p).resolve())
+            # p = p.format("lwir")
             if "*" in p:
                 files.extend(sorted(glob.glob(p, recursive=True)))  # glob
             elif os.path.isdir(p):
@@ -554,6 +559,7 @@ class LoadImagesAndLabels(Dataset):
         prefix="",
         rank=-1,
         seed=0,
+        modality=None,
     ):
         self.img_size = img_size
         self.augment = augment
@@ -566,6 +572,8 @@ class LoadImagesAndLabels(Dataset):
         self.path = path
         self.albumentations = Albumentations(size=img_size) if augment else None
 
+        self.modality = modality
+        
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -643,7 +651,11 @@ class LoadImagesAndLabels(Dataset):
             self.indices = self.indices[np.random.RandomState(seed=seed).permutation(n) % WORLD_SIZE == RANK]
 
         # Update labels
-        include_class = []  # filter labels to include only these classes (optional)
+        # include_class = [0, 1, 3]  # filter labels to include only these classes (optional) # !!
+        # include_class = [0, 1]
+        # include_class = []
+        include_class = []
+        
         self.segments = list(self.segments)
         include_class_array = np.array(include_class).reshape(1, -1)
         for i, (label, segment) in enumerate(zip(self.labels, self.segments)):
@@ -1084,24 +1096,27 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
     def __init__(self, path, **kwargs):
         # HACK: cannot guarantee that path contain split name
-        is_train = 'train' in path
+        # is_train = 'train' in path
+        is_train = "train" in Path(path[0]).stem.lower()
+
         single_cls = kwargs['single_cls']
         kwargs['single_cls'] = False
         assert kwargs['cache_images'] != 'ram', 'Image caching for RGBT dataset is not implemented yet.'
         if not is_train:
             assert not kwargs['rect'], 'Please do not turn-on "rect" option for validation. ' \
                                   'It causes shuffling of images and breaks the kaist evaluation pipeline.'
-
         super().__init__(path, **kwargs)
 
         # TODO: make mosaic augmentation work
-        self.mosaic = False
+        self.mosaic = is_train
+        print(self.mosaic)
+        # self.mosaic = False
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
         for i in range(len(self.labels)):
             if single_cls:  # single-class training, merge all classes into 0
-                self.labels[i][self.labels[i][:, 0] != 0, 0] = -1   # ignore cyclist / people / person
+                self.labels[i][self.labels[i][:, 0] != 0, 0] = -1   # ignore cyclist / people / person # !!
 
             if len(self.labels[i]):
                 x1, y1, w, h = self.labels[i][:,1:5].T
@@ -1117,6 +1132,94 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                             (h > cond['hRng'][1])
                 self.labels[i][ignore_idx, 0] = -1
 
+    def load_mosaic(self, index):
+        """Loads a 4-image mosaic for RGBT YOLOv5, combining 1 selected and 3 random images for each modality (LWIR + VIS), with labels and segments."""
+        labels4, segments4 = [], []
+        s = self.img_size
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
+        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+        random.shuffle(indices)
+        
+        # Initialize base images for both modalities
+        img4_lwir = None
+        img4_vis = None
+        
+        for i, index in enumerate(indices):
+            # Load image for both modalities (LWIR and VIS)
+            imgs, _, img_shapes = self.load_image(index)  # imgs = [lwir_img, vis_img]
+            img_lwir, img_vis = imgs[0], imgs[1]  # Split modalities
+            h, w = img_shapes[0]  # Use first modality's shape (both should be same)
+
+            # place img in img4 for both modalities
+            if i == 0:  # top left
+                img4_lwir = np.full((s * 2, s * 2, img_lwir.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles (LWIR)
+                img4_vis = np.full((s * 2, s * 2, img_vis.shape[2]), 114, dtype=np.uint8)    # base image with 4 tiles (VIS)
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+
+            # Place images for both modalities
+            img4_lwir[y1a:y2a, x1a:x2a] = img_lwir[y1b:y2b, x1b:x2b]  # LWIR modality
+            img4_vis[y1a:y2a, x1a:x2a] = img_vis[y1b:y2b, x1b:x2b]    # VIS modality
+            
+            padw = x1a - x1b
+            padh = y1a - y1b
+
+            # Labels (same for both modalities since they share annotations)
+            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            if labels.size:
+                # Convert from (x_lefttop, y_lefttop, width, height) to (x_center, y_center, width, height)
+                labels[:, 1:3] += labels[:, 3:5] / 2.0
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+                segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
+            labels4.append(labels)
+            segments4.extend(segments)
+
+        # Concat/clip labels
+        labels4 = np.concatenate(labels4, 0)
+        for x in (labels4[:, 1:], *segments4):
+            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+
+        # seed = random.randint(0, 1e9)
+        # random.seed(seed)
+        img4_lwir, labels4, segments4 = copy_paste(img4_lwir, labels4, segments4, p=self.hyp["copy_paste"])
+        # random.seed(seed)
+        img4_vis, _, _ = copy_paste(img4_vis, labels4.copy(), segments4.copy(), p=self.hyp["copy_paste"])   
+
+        # n = len(segments4)
+        # if self.hyp["copy_paste"] and n:
+        #     copy_paste_indices = random.sample(range(n), k=round(self.hyp["copy_paste"] * n))
+
+        #     original_labels = labels4.copy()
+        #     original_segments = segments4.copy()            
+
+        #     img4_lwir, labels4, segments4 = copy_paste2(img4_lwir, original_labels, original_segments, copy_paste_indices)
+        #     img4_vis, _, _ = copy_paste2(img4_vis, original_labels, original_segments, copy_paste_indices)   
+
+        img4_concat = np.concatenate([img4_lwir, img4_vis], axis=2)
+
+        img4_concat, labels4 = random_perspective(
+            img4_concat,
+            labels4,
+            segments4,
+            degrees=self.hyp["degrees"],
+            translate=self.hyp["translate"],
+            scale=self.hyp["scale"],
+            shear=self.hyp["shear"],
+            perspective=self.hyp["perspective"],
+            border=self.mosaic_border,
+        )
+
+        return img4_concat, labels4
+    
     def img2label_paths(self, img_paths):
         """Generates label file paths from corresponding image file paths by replacing `/images/{}` with `/labels/` and
         extension with `.txt`.
@@ -1200,15 +1303,38 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
         if mosaic:
-            raise NotImplementedError('Please make "mosaic" augmentation work!')
-
-            # TODO: Load mosaic
+            # Load mosaic
             img, labels = self.load_mosaic(index)
             shapes = None
 
-            # TODO: MixUp augmentation
+            # MixUp augmentation
             if random.random() < hyp["mixup"]:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+
+            # Split concatenated 6-channel image back to separate modalities
+            img_lwir = img[:, :, :3]
+            img_vis = img[:, :, 3:]
+            
+            # Process labels for mosaic
+            nl = len(labels)  # number of labels
+            if nl:
+                labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
+
+            # Convert images to tensors
+            img_lwir = img_lwir.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+            img_lwir = np.ascontiguousarray(img_lwir)
+            img_vis = img_vis.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB  
+            img_vis = np.ascontiguousarray(img_vis)
+            
+            imgs = [torch.from_numpy(img_lwir), torch.from_numpy(img_vis)]
+            
+            # Create labels tensor
+            labels_out = torch.zeros((nl, 6))  # 6 columns instead of 7 since we'll drop occlusion
+            if nl:
+                # Drop occlusion level (last column) before creating tensor
+                if labels.shape[1] > 5:
+                    labels = labels[:, :-1]  # Remove occlusion level
+                labels_out[:, 1:] = torch.from_numpy(labels)
 
         else:
             # Load image
@@ -1227,7 +1353,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                     labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
                 if self.augment:
-                    raise NotImplementedError('Please make data augmentation work!')
+                    # raise NotImplementedError('Please make data augmentation work!')
 
                     img, labels = random_perspective(
                         img,
@@ -1278,7 +1404,9 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                 imgs[ii] = torch.from_numpy(img)
 
         # Drop occlusion level
-        labels_out = labels_out[:, :-1]
+        if not mosaic:
+            labels_out = labels_out[:, :-1]
+        
         return imgs, labels_out, self.im_files[index], shapes, index
 
     def load_image(self, i):
@@ -1297,7 +1425,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
             if all(fn.exists() for fn in fns):  # load npy
                 imgs = [np.load(fn) for fn in fns]
             else:  # read image
-                imgs = [cv2.imread(f.format(m)) for m in self.modalities]  # BGR
+                imgs = [cv2.imread(f.format(m)) for m in self.modalities]  # BGR # !!
                 assert all(img is not None for img in imgs), f"Image Not Found {f}"
 
             h0s, w0s = [], []

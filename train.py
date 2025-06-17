@@ -48,7 +48,7 @@ import val as validate  # for end-of-epoch mAP
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
-from utils.autobatch import check_train_batch_size
+# from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
 from utils.downloads import attempt_download, is_url
@@ -127,7 +127,8 @@ def train(hyp, opt, device, callbacks):
     # Directories
     w = save_dir / "weights"  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
-    last, best = w / "last.pt", w / "best.pt"
+    last = w 
+    best = w / "best.pt"
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -210,9 +211,10 @@ def train(hyp, opt, device, callbacks):
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
     # Batch size
-    if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
-        batch_size = check_train_batch_size(model, imgsz, amp)
-        loggers.on_params_update({"batch_size": batch_size})
+    # if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
+    #     batch_size = check_train_batch_size(model, imgsz, amp)
+    #     loggers.on_params_update({"batch_size": batch_size})
+    batch_size = opt.batch_size
 
     # Optimizer
     nbs = 64  # nominal batch size
@@ -268,6 +270,7 @@ def train(hyp, opt, device, callbacks):
         prefix=colorstr("train: "),
         shuffle=True,
         seed=opt.seed,
+        rgbt_input=opt.rgbt
     )
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
@@ -283,12 +286,15 @@ def train(hyp, opt, device, callbacks):
             single_cls,
             hyp=hyp,
             cache=None if noval else opt.cache,
-            rect=True,
+            # rect=True,
+            rect = False,
             rank=-1,
             workers=workers * 2,
             pad=0.5,
             prefix=colorstr("val: "),
+            rgbt_input=opt.rgbt
         )[0]
+
 
         if not resume:
             if not opt.noautoanchor:
@@ -353,10 +359,17 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+
+
+        for i, (imgs, targets, paths, _, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+
+            if isinstance(imgs, list):
+                imgs = [img.to(device, non_blocking=True).float() / 255 for img in imgs]    # For RGB-T input
+                # imgs = torch.cat(imgs, dim=1) # !!
+            else:
+                imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
             # Warmup
             if ni <= nw:
@@ -378,7 +391,7 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.cuda.amp.autocast(amp):
+            with torch.amp.autocast(device_type='cuda', enabled=amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -406,7 +419,7 @@ def train(hyp, opt, device, callbacks):
                 mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5)
-                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], (imgs[0] if isinstance(imgs, list) else imgs).shape[-1])
                 )
                 callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
@@ -430,6 +443,8 @@ def train(hyp, opt, device, callbacks):
                     half=amp,
                     model=ema.ema,
                     single_cls=single_cls,
+                    epoch=epoch,
+                    save_json=True,
                     dataloader=val_loader,
                     save_dir=save_dir,
                     plots=False,
@@ -460,7 +475,8 @@ def train(hyp, opt, device, callbacks):
                 }
 
                 # Save last, best and delete
-                torch.save(ckpt, last)
+                # if epoch >= 70:
+                torch.save(ckpt, os.path.join(w, f"epoch_{epoch}.pt"))
                 if best_fitness == fi:
                     torch.save(ckpt, best)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
@@ -495,7 +511,7 @@ def train(hyp, opt, device, callbacks):
                         single_cls=single_cls,
                         dataloader=val_loader,
                         save_dir=save_dir,
-                        save_json=is_coco,
+                        save_json=True,
                         verbose=True,
                         plots=plots,
                         callbacks=callbacks,
@@ -509,14 +525,13 @@ def train(hyp, opt, device, callbacks):
     torch.cuda.empty_cache()
     return results
 
-
 def parse_opt(known=False):
     """Parses command-line arguments for YOLOv5 training, validation, and testing."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
-    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
+    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-custom.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
@@ -551,6 +566,7 @@ def parse_opt(known=False):
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+    parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")
 
     # Logger arguments
     parser.add_argument("--entity", default=None, help="Entity")
